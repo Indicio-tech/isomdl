@@ -583,7 +583,7 @@ pub mod test {
         Ok(())
     }
 
-    fn minimal_test_mdoc_builder() -> Builder {
+    pub fn minimal_test_mdoc_builder() -> Builder {
         let doc_type = String::from("org.iso.18013.5.1.mDL");
         let isomdl_namespace = String::from("org.iso.18013.5.1");
         let aamva_namespace = String::from("org.iso.18013.5.1.aamva");

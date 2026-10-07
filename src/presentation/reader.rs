@@ -596,13 +596,21 @@ fn parse_response(value: ciborium::Value) -> Result<Value, Error> {
     }
 }
 
+const MDL_DOCTYPE: &str = "org.iso.18013.5.1.mDL";
+const MDL_NAMESPACE: &str = "org.iso.18013.5.1";
+
+/// Select the document to verify. An mDL is preferred when one is present, so
+/// mDL behaviour is unchanged; otherwise the first document of any doctype is
+/// used (an ISO/IEC 18013-5 or 23220 mdoc of another doctype).
 fn get_document(device_response: &DeviceResponse) -> Result<&Document, Error> {
-    device_response
+    let documents = device_response
         .documents
         .as_ref()
-        .ok_or(ReaderError::DeviceTransmissionError)?
+        .ok_or(ReaderError::DeviceTransmissionError)?;
+    documents
         .iter()
-        .find(|doc| doc.doc_type == "org.iso.18013.5.1.mDL")
+        .find(|doc| doc.doc_type == MDL_DOCTYPE)
+        .or_else(|| documents.iter().next())
         .ok_or(ReaderError::DocumentTypeError)
 }
 
@@ -628,20 +636,13 @@ fn _validate_request(namespaces: device_request::Namespaces) -> Result<bool, Err
     Ok(true)
 }
 
-// TODO: Support other namespaces.
+/// Return every disclosed namespace of the selected document, keyed by namespace.
+/// For an mDL the core `org.iso.18013.5.1` namespace is still required.
 pub fn parse_namespaces(
     device_response: &DeviceResponse,
 ) -> Result<BTreeMap<String, serde_json::Value>, Error> {
-    let mut core_namespace = BTreeMap::<String, serde_json::Value>::new();
-    let mut aamva_namespace = BTreeMap::<String, serde_json::Value>::new();
-    let mut parsed_response = BTreeMap::<String, serde_json::Value>::new();
-    let mut namespaces = device_response
-        .documents
-        .as_ref()
-        .ok_or(Error::DeviceTransmissionError)?
-        .iter()
-        .find(|doc| doc.doc_type == "org.iso.18013.5.1.mDL")
-        .ok_or(Error::DocumentTypeError)?
+    let document = get_document(device_response)?;
+    let namespaces = document
         .issuer_signed
         .namespaces
         .as_ref()
@@ -649,40 +650,23 @@ pub fn parse_namespaces(
         .clone()
         .into_inner();
 
-    namespaces
-        .remove("org.iso.18013.5.1")
-        .ok_or(Error::IncorrectNamespace)?
-        .into_inner()
-        .into_iter()
-        .map(|item| item.into_inner())
-        .for_each(|item| {
-            let value = parse_response(item.element_value.clone());
-            if let Ok(val) = value {
-                core_namespace.insert(item.element_identifier, val);
-            }
-        });
+    if document.doc_type == MDL_DOCTYPE && !namespaces.contains_key(MDL_NAMESPACE) {
+        return Err(Error::IncorrectNamespace);
+    }
 
-    parsed_response.insert(
-        "org.iso.18013.5.1".to_string(),
-        serde_json::to_value(core_namespace)?,
-    );
-
-    if let Some(aamva_response) = namespaces.remove("org.iso.18013.5.1.aamva") {
-        aamva_response
+    let mut parsed_response = BTreeMap::<String, serde_json::Value>::new();
+    for (namespace, items) in namespaces {
+        let mut elements = BTreeMap::<String, serde_json::Value>::new();
+        items
             .into_inner()
             .into_iter()
             .map(|item| item.into_inner())
             .for_each(|item| {
-                let value = parse_response(item.element_value.clone());
-                if let Ok(val) = value {
-                    aamva_namespace.insert(item.element_identifier, val);
+                if let Ok(val) = parse_response(item.element_value.clone()) {
+                    elements.insert(item.element_identifier, val);
                 }
             });
-
-        parsed_response.insert(
-            "org.iso.18013.5.1.aamva".to_string(),
-            serde_json::to_value(aamva_namespace)?,
-        );
+        parsed_response.insert(namespace, serde_json::to_value(elements)?);
     }
     Ok(parsed_response)
 }
@@ -714,5 +698,219 @@ pub mod test {
           ]
         );
         assert_eq!(json, expected)
+    }
+
+    // Helpers for the generic-doctype tests, also used by `reader_utils` tests.
+
+    use crate::definitions::{
+        device_response::Status,
+        device_signed::{DeviceAuth, DeviceSigned},
+        x509::trust_anchor::{TrustAnchor, TrustPurpose},
+        IssuerSigned, ValidityInfo,
+    };
+    use crate::issuance::{Mdoc, Namespaces};
+    use p256::ecdsa::{Signature, SigningKey};
+
+    /// A custom (non-mDL) doctype; its namespace equals the doctype.
+    pub(crate) const TEST_DOCTYPE: &str = "org.example.custom.1";
+
+    /// A freshly generated IACA root (the only trust anchor), a document signer
+    /// chain issued by it, and the document signer's key.
+    pub(crate) fn trusted_signer() -> (TrustAnchorRegistry, X5Chain, SigningKey) {
+        use crate::definitions::x509::test::{
+            prepare_root_certificate, prepare_signer_certificate,
+        };
+        use signature::Signer;
+        use x509_cert::{builder::Builder, spki::SignatureBitStringEncoding};
+
+        let root_key = SigningKey::random(&mut rand::thread_rng());
+        let signer_key = SigningKey::random(&mut rand::thread_rng());
+        let issuer: x509_cert::name::Name = "CN=issuer,C=US".parse().unwrap();
+        let crl_url = "http://example.com/crl".to_string();
+
+        let mut root = prepare_root_certificate(&root_key, issuer.clone(), crl_url.clone());
+        let signature: Signature = root_key.sign(&root.finalize().unwrap());
+        let root = root
+            .assemble(signature.to_der().to_bitstring().unwrap())
+            .unwrap();
+
+        let mut signer = prepare_signer_certificate(&signer_key, &root_key, issuer, crl_url);
+        let signature: Signature = root_key.sign(&signer.finalize().unwrap());
+        let signer = signer
+            .assemble(signature.to_der().to_bitstring().unwrap())
+            .unwrap();
+
+        let registry = TrustAnchorRegistry {
+            anchors: vec![TrustAnchor {
+                certificate: root,
+                purpose: TrustPurpose::Iaca,
+            }],
+        };
+        let x5chain = X5Chain::builder()
+            .with_certificate(signer)
+            .unwrap()
+            .build()
+            .unwrap();
+        (registry, x5chain, signer_key)
+    }
+
+    /// A validity window from `now + from_days` to `now + until_days`.
+    pub(crate) fn validity(from_days: i64, until_days: i64) -> ValidityInfo {
+        let now = time::OffsetDateTime::now_utc();
+        ValidityInfo {
+            signed: now,
+            valid_from: now + time::Duration::days(from_days),
+            valid_until: now + time::Duration::days(until_days),
+            expected_update: None,
+        }
+    }
+
+    /// Elements of the custom-doctype namespace: text, boolean and array values.
+    pub(crate) fn custom_namespaces() -> Namespaces {
+        use ciborium::Value as Cbor;
+        let elements = [
+            ("given_name", Cbor::Text("Test".into())),
+            ("family_name", Cbor::Text("Holder".into())),
+            ("active", Cbor::Bool(true)),
+            (
+                "tags",
+                Cbor::Array(vec![Cbor::Text("a".into()), Cbor::Text("b".into())]),
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        [(TEST_DOCTYPE.to_string(), elements)].into_iter().collect()
+    }
+
+    /// Issue an mdoc whose signed MSO names `doc_type`. `namespaces: None` keeps the
+    /// mDL namespaces of the crate's minimal test mdoc.
+    pub(crate) fn issue(
+        doc_type: &str,
+        namespaces: Option<Namespaces>,
+        validity_info: ValidityInfo,
+        x5chain: X5Chain,
+        signer: SigningKey,
+    ) -> Mdoc {
+        let mut builder = crate::issuance::mdoc::test::minimal_test_mdoc_builder()
+            .doc_type(doc_type.to_string())
+            .validity_info(validity_info);
+        if let Some(namespaces) = namespaces {
+            builder = builder.namespaces(namespaces);
+        }
+        builder
+            .issue::<SigningKey, Signature>(x5chain, signer)
+            .expect("issue test mdoc")
+    }
+
+    /// A response document presenting `mdoc` under `doc_type`. Device signing is a
+    /// placeholder: these tests cover document selection and issuer authentication.
+    pub(crate) fn document(mdoc: &Mdoc, doc_type: &str) -> Document {
+        Document {
+            doc_type: doc_type.to_string(),
+            issuer_signed: IssuerSigned {
+                namespaces: Some(mdoc.namespaces.clone()),
+                issuer_auth: mdoc.issuer_auth.clone(),
+            },
+            device_signed: DeviceSigned {
+                namespaces: Tag24::new(BTreeMap::new()).unwrap(),
+                device_auth: DeviceAuth::DeviceSignature(mdoc.issuer_auth.clone()),
+            },
+            errors: None,
+        }
+    }
+
+    pub(crate) fn device_response(documents: Vec<Document>) -> DeviceResponse {
+        DeviceResponse {
+            version: "1.0".to_string(),
+            documents: NonEmptyVec::maybe_new(documents),
+            document_errors: None,
+            status: Status::OK,
+        }
+    }
+
+    fn custom_document() -> Document {
+        let (_, x5chain, signer) = trusted_signer();
+        let mdoc = issue(
+            TEST_DOCTYPE,
+            Some(custom_namespaces()),
+            validity(-1, 1),
+            x5chain,
+            signer,
+        );
+        document(&mdoc, TEST_DOCTYPE)
+    }
+
+    fn mdl_document() -> Document {
+        let (_, x5chain, signer) = trusted_signer();
+        let mdoc = issue(MDL_DOCTYPE, None, validity(-1, 1), x5chain, signer);
+        document(&mdoc, MDL_DOCTYPE)
+    }
+
+    #[test]
+    fn custom_doctype_only_response_is_selected() {
+        let response = device_response(vec![custom_document()]);
+        let (document, _, namespaces) = parse(&response).expect("custom doctype is parsed");
+        assert_eq!(document.doc_type, TEST_DOCTYPE);
+        assert_eq!(
+            namespaces.keys().collect::<Vec<_>>(),
+            vec![TEST_DOCTYPE],
+            "only the custom namespace is returned"
+        );
+    }
+
+    #[test]
+    fn mixed_response_selects_the_mdl() {
+        // The custom document comes first; the mDL is still the one selected.
+        let response = device_response(vec![custom_document(), mdl_document()]);
+        assert_eq!(get_document(&response).unwrap().doc_type, MDL_DOCTYPE);
+        let (document, _, namespaces) = parse(&response).expect("mixed response is parsed");
+        assert_eq!(document.doc_type, MDL_DOCTYPE);
+        assert!(namespaces.contains_key(MDL_NAMESPACE));
+        assert!(!namespaces.contains_key(TEST_DOCTYPE));
+    }
+
+    #[test]
+    fn mdl_without_core_namespace_is_rejected() {
+        let (_, x5chain, signer) = trusted_signer();
+        let mdoc = issue(
+            MDL_DOCTYPE,
+            Some(custom_namespaces()),
+            validity(-1, 1),
+            x5chain,
+            signer,
+        );
+        let response = device_response(vec![document(&mdoc, MDL_DOCTYPE)]);
+        let result = parse_namespaces(&response);
+        assert!(
+            matches!(result, Err(Error::IncorrectNamespace)),
+            "an mDL without {MDL_NAMESPACE} must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn custom_namespace_elements_are_returned() {
+        let response = device_response(vec![custom_document()]);
+        let namespaces = parse_namespaces(&response).expect("custom namespace is parsed");
+        assert_eq!(
+            namespaces[TEST_DOCTYPE],
+            serde_json::json!({
+                "given_name": "Test",
+                "family_name": "Holder",
+                "active": true,
+                "tags": ["a", "b"],
+            })
+        );
+    }
+
+    #[test]
+    fn mdl_response_returns_core_and_aamva_namespaces() {
+        let response = device_response(vec![mdl_document()]);
+        let namespaces = parse_namespaces(&response).expect("mDL is parsed");
+        assert_eq!(
+            namespaces.keys().collect::<Vec<_>>(),
+            vec![MDL_NAMESPACE, "org.iso.18013.5.1.aamva"]
+        );
+        assert_eq!(namespaces[MDL_NAMESPACE]["family_name"], "Smith");
     }
 }
