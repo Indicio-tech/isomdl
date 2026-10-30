@@ -38,6 +38,15 @@ pub struct ResponseAuthenticationOutcome {
     pub issuer_authentication: AuthenticationStatus,
     /// Outcome of device authentication.
     pub device_authentication: AuthenticationStatus,
+    /// The `status` claim from the presented document's MSO (e.g. an IETF token status list
+    /// reference: `{"status_list": {"idx": ..., "uri": ...}}`), if it has one.
+    ///
+    /// Only set when issuer authentication is [`AuthenticationStatus::Valid`]. Before that
+    /// the MSO is unauthenticated and the claim must not be trusted, so it stays `None`.
+    /// `None` therefore means "no status claim, or the issuer was not authenticated": check
+    /// `issuer_authentication` to tell them apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<Value>,
     /// Errors that occurred during response processing.
     pub errors: Errors,
     /// Non-fatal warnings that occurred during response processing.

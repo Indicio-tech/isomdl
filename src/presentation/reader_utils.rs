@@ -124,6 +124,16 @@ where
         match issuer_authentication(x5chain, &document.issuer_signed) {
             Ok(mso) => {
                 validated_response.issuer_authentication = AuthenticationStatus::Valid;
+                // The MSO signature is verified, so its status claim is authentic. A claim
+                // that can't be represented as JSON is reported, not mistaken for "no status".
+                match status_claim_as_json(mso.status.as_ref()) {
+                    Ok(status) => validated_response.status = status,
+                    Err(e) => {
+                        validated_response
+                            .errors
+                            .insert("status_claim_errors".to_string(), json!(vec![e]));
+                    }
+                }
 
                 // The MSO signature is trusted, so its validity window can be trusted.
                 // Reject expired / not-yet-valid credentials (ISO 18013-5 §9.1.2.4).
@@ -151,4 +161,52 @@ where
     };
 
     validated_response
+}
+
+/// The MSO `status` claim as JSON, or `None` if the MSO has no status claim.
+fn status_claim_as_json(
+    status: Option<&ciborium::Value>,
+) -> Result<Option<serde_json::Value>, String> {
+    status
+        .map(|status| {
+            serde_json::to_value(status)
+                .map_err(|e| format!("unable to read the MSO status claim: {e}"))
+        })
+        .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ciborium::cbor;
+
+    #[test]
+    fn status_claim_converts_to_json() {
+        let status = cbor!({
+            "status_list" => { "idx" => 42, "uri" => "https://example.com/statuslists/1" }
+        })
+        .unwrap();
+
+        assert_eq!(
+            status_claim_as_json(Some(&status)),
+            Ok(Some(json!({
+                "status_list": { "idx": 42, "uri": "https://example.com/statuslists/1" }
+            })))
+        );
+    }
+
+    #[test]
+    fn missing_status_claim_is_none() {
+        assert_eq!(status_claim_as_json(None), Ok(None));
+    }
+
+    #[test]
+    fn unrepresentable_status_claim_is_an_error_not_none() {
+        // A JSON object key must be a string or a number; a CBOR map keyed by an array can't be one.
+        let status = ciborium::Value::Map(vec![(
+            ciborium::Value::Array(vec![ciborium::Value::Integer(1.into())]),
+            ciborium::Value::Text("x".to_string()),
+        )]);
+        assert!(status_claim_as_json(Some(&status)).is_err());
+    }
 }
